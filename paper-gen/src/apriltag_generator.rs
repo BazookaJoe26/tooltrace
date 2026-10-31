@@ -182,30 +182,38 @@ mod tests {
     #[test]
     fn test_generate_tag_0() {
         let img = generate_apriltag(0, 10).unwrap();
-        assert_eq!(img.width(), 80); // 8x8 grid * 10 pixels/bit
-        assert_eq!(img.height(), 80);
+        assert_eq!(img.width(), 100); // 10x10 grid including the white quiet zone
+        assert_eq!(img.height(), 100);
     }
 
     #[test]
-    fn test_border_is_black() {
+    fn test_white_quiet_zone_and_black_border() {
         let img = generate_apriltag(0, 1).unwrap();
 
-        // Check corners are black (outer border)
-        assert_eq!(img.get_pixel(0, 0)[0], 0);
-        assert_eq!(img.get_pixel(7, 0)[0], 0);
-        assert_eq!(img.get_pixel(0, 7)[0], 0);
-        assert_eq!(img.get_pixel(7, 7)[0], 0);
+        for i in 0..10 {
+            assert_eq!(img.get_pixel(i, 0)[0], 255);
+            assert_eq!(img.get_pixel(i, 9)[0], 255);
+            assert_eq!(img.get_pixel(0, i)[0], 255);
+            assert_eq!(img.get_pixel(9, i)[0], 255);
+        }
+        for i in 1..9 {
+            assert_eq!(img.get_pixel(i, 1)[0], 0);
+            assert_eq!(img.get_pixel(i, 8)[0], 0);
+            assert_eq!(img.get_pixel(1, i)[0], 0);
+            assert_eq!(img.get_pixel(8, i)[0], 0);
+        }
     }
 
     #[test]
     fn test_data_area_from_pattern() {
         let img = generate_apriltag(0, 1).unwrap();
 
-        // The data area is 1-6, which encodes the bit pattern
-        // We can't predict exact values without decoding the pattern,
-        // but we can verify the grid size
-        assert_eq!(img.width(), 8);
-        assert_eq!(img.height(), 8);
+        // Check all 36 data cells independently against the codeword mapping.
+        let pattern = get_tag_pattern(0).unwrap();
+        for i in 0..36 {
+            let expected = if (pattern >> (35 - i)) & 1 == 0 { 0 } else { 255 };
+            assert_eq!(img.get_pixel(BIT_X[i] + 1, BIT_Y[i] + 1)[0], expected);
+        }
     }
 
     #[test]

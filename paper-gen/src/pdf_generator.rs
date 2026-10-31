@@ -191,9 +191,12 @@ impl PdfGenerator {
         // Get the bit pattern for this tag ID
         let bit_pattern = get_tag_pattern(tag_id)?;
 
-        // AprilTag is 10x10 grid (1 white + 1 black border + 6x6 data + 1 black + 1 white border)
+        // The 10x10 grid includes a one-cell white quiet zone on each side.
+        // tag_size_mm measures only the 8x8 outer black square, whose bottom-left
+        // corner is (x_mm, y_mm), matching marker placement and calibration.
         let grid_size = 10;
-        let cell_size_mm = tag_size_mm / grid_size as f32;
+        let black_grid_size = grid_size - 2;
+        let cell_size_mm = tag_size_mm / black_grid_size as f32;
 
         // Set drawing style - black fill for tag bits
         layer.set_fill_color(Color::Rgb(Rgb::new(0.0, 0.0, 0.0, None)));
@@ -209,8 +212,8 @@ impl PdfGenerator {
                     // Calculate position for this cell (top-left corner)
                     // Note: PDF coordinates have Y=0 at bottom, but our grid has Y=0 at top
                     // So we flip the Y coordinate to match PNG generator orientation
-                    let cell_x = x_mm + (grid_x as f32 * cell_size_mm);
-                    let cell_y = y_mm + ((grid_size - 1 - grid_y) as f32 * cell_size_mm);
+                    let cell_x = x_mm + ((grid_x - 1) as f32 * cell_size_mm);
+                    let cell_y = y_mm + ((grid_size - 2 - grid_y) as f32 * cell_size_mm);
 
                     // Draw a filled rectangle for this cell
                     let points = vec![
@@ -232,5 +235,59 @@ impl PdfGenerator {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use printpdf::lopdf::{content::Content, Document};
+
+    #[test]
+    fn pdf_black_squares_have_requested_size_and_position() {
+        for paper_size in [PaperSize::A4, PaperSize::Letter, PaperSize::A3] {
+            for tag_size_mm in [40.0, 50.0, 60.0] {
+                let generator = PdfGenerator::new(paper_size, tag_size_mm);
+                let (width, height) = paper_size.dimensions_mm();
+                let (doc, page, layer) = PdfDocument::new(
+                    "Size regression", Mm(width as f32), Mm(height as f32), "Tags",
+                );
+                generator.embed_apriltags(&doc.get_page(page).get_layer(layer), &doc).unwrap();
+
+                // Measure the actual vector paths in the serialized PDF, in mm.
+                let pdf = Document::load_mem(&doc.save_to_bytes().unwrap()).unwrap();
+                let page_id = *pdf.get_pages().values().next().unwrap();
+                let content = Content::decode(&pdf.get_page_content(page_id).unwrap()).unwrap();
+                let mut bounds = [(f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY); 4];
+                for op in content.operations {
+                    if op.operator == "m" || op.operator == "l" {
+                        let x = op.operands[0].as_float().unwrap() as f64 * 25.4 / 72.0;
+                        let y = op.operands[1].as_float().unwrap() as f64 * 25.4 / 72.0;
+                        let corner = match (x < width / 2.0, y > height / 2.0) {
+                            (true, true) => 0,
+                            (false, true) => 1,
+                            (false, false) => 2,
+                            (true, false) => 3,
+                        };
+                        let b = &mut bounds[corner];
+                        b.0 = b.0.min(x);
+                        b.1 = b.1.min(y);
+                        b.2 = b.2.max(x);
+                        b.3 = b.3.max(y);
+                    }
+                }
+
+                let positions = calculate_marker_positions(paper_size, &generator.tag_config);
+                for (b, (x, y)) in bounds.into_iter().zip(positions) {
+                    for (actual, expected) in [
+                        (b.0, x), (b.1, y),
+                        (b.2 - b.0, tag_size_mm), (b.3 - b.1, tag_size_mm),
+                    ] {
+                        assert!((actual - expected).abs() < 0.001,
+                            "{paper_size}, tag {tag_size_mm} mm: expected {expected}, got {actual}");
+                    }
+                }
+            }
+        }
     }
 }
