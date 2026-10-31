@@ -9,11 +9,11 @@ use image::RgbImage;
 /// Reduces the number of points and fits a smooth spline through them
 pub fn apply_spline_smoothing(
     contours: Vec<Contour>,
-    decimation_factor: usize,
+    control_spacing_pixels: usize,
     debug_path: Option<&str>,
     source_image: Option<&RgbImage>,
 ) -> Result<Vec<Contour>> {
-    println!("Applying spline smoothing with decimation factor {}...", decimation_factor);
+    println!("Applying spline smoothing with maximum control spacing {} pixels...", control_spacing_pixels);
 
     let mut smoothed_contours = Vec::new();
 
@@ -26,9 +26,9 @@ pub fn apply_spline_smoothing(
 
         println!("  Contour {}: {} points -> smoothing...", idx, contour.points.len());
 
-        // Step 1: Decimate the contour to reduce high-frequency noise
-        let decimated = decimate_contour(&contour.points, decimation_factor);
-        println!("    After decimation: {} points", decimated.len());
+        // Step 1: Simplify pixel noise and resample controls without discarding corners.
+        let decimated = decimate_contour(&contour.points, control_spacing_pixels, contour.closed)?;
+        println!("    After control resampling: {} points", decimated.len());
 
         // Step 2: Apply Catmull-Rom spline interpolation for smooth curves
         let smoothed = catmull_rom_spline(&decimated, contour.closed);
@@ -50,31 +50,35 @@ pub fn apply_spline_smoothing(
     Ok(smoothed_contours)
 }
 
-/// Decimate a contour by keeping every Nth point
-/// This reduces high-frequency detail and creates a low-frequency representation
-fn decimate_contour(points: &[Point2DMm], factor: usize) -> Vec<Point2DMm> {
-    if factor <= 1 {
-        return points.to_vec();
+/// Simplify by at most one pixel, preserve geometric corners, and bound the
+/// spacing of spline controls. Keeping every Nth vertex can delete entire jaws
+/// and make splines overshoot long straight edges of CHAIN_APPROX_SIMPLE paths.
+fn decimate_contour(points: &[Point2DMm], factor: usize, closed: bool) -> Result<Vec<Point2DMm>> {
+    use opencv::core::{Point2f, Vector};
+    let input: Vector<Point2f> = points.iter().map(|p| Point2f::new(p.x as f32, p.y as f32)).collect();
+    let mut simplified: Vector<Point2f> = Vector::new();
+    opencv::imgproc::approx_poly_dp(&input, &mut simplified, 1.0, closed)?;
+    let vertices: Vec<Point2DMm> = simplified.iter()
+        .map(|p| Point2DMm::new(p.x as f64, p.y as f64)).collect();
+    if vertices.len() < 2 {
+        return Ok(vertices);
     }
-
-    let mut decimated = Vec::new();
-
-    for (i, point) in points.iter().enumerate() {
-        if i % factor == 0 {
-            decimated.push(*point);
+    let mut controls = Vec::new();
+    let spans = if closed { vertices.len() } else { vertices.len() - 1 };
+    let spacing = factor.max(1) as f64;
+    for i in 0..spans {
+        let a = vertices[i];
+        let b = vertices[(i + 1) % vertices.len()];
+        let steps = ((b.x - a.x).hypot(b.y - a.y) / spacing).ceil().max(1.0) as usize;
+        for j in 0..steps {
+            let t = j as f64 / steps as f64;
+            controls.push(Point2DMm::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y)));
         }
     }
-
-    // Ensure we include the last point if not already included
-    if !decimated.is_empty() && decimated.len() * factor < points.len() {
-        if let Some(last) = points.last() {
-            if decimated.last() != Some(last) {
-                decimated.push(*last);
-            }
-        }
+    if !closed {
+        controls.push(*vertices.last().unwrap());
     }
-
-    decimated
+    Ok(controls)
 }
 
 /// Apply Catmull-Rom spline interpolation to create smooth curves
@@ -116,11 +120,6 @@ fn catmull_rom_spline(control_points: &[Point2DMm], closed: bool) -> Vec<Point2D
         } else {
             control_points[i + 2]
         };
-
-        // Skip the last segment for closed curves to avoid duplication
-        if closed && i == n - 1 {
-            break;
-        }
 
         // Interpolate between p1 and p2
         for j in 0..segments_per_span {
@@ -241,4 +240,30 @@ fn save_smoothing_debug(
     println!("  Red: Original contours, Green: Smoothed contours");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoothing_preserves_sparse_rectangle_size_and_closure() {
+        let rectangle = Contour {
+            points: vec![Point2DMm::new(0.0, 0.0), Point2DMm::new(1000.0, 0.0),
+                Point2DMm::new(1000.0, 600.0), Point2DMm::new(0.0, 600.0)],
+            closed: true,
+        };
+        let result = apply_spline_smoothing(vec![rectangle], 5, None, None).unwrap();
+        assert_eq!(result.len(), 1);
+        let points = &result[0].points;
+        assert!(points.len() > 4);
+        assert!(result[0].closed);
+        for p in points {
+            assert!(p.x >= -0.5 && p.x <= 1000.5);
+            assert!(p.y >= -0.5 && p.y <= 600.5);
+        }
+        let first = points.first().unwrap();
+        let last = points.last().unwrap();
+        assert!((first.x - last.x).hypot(first.y - last.y) <= 1.0);
+    }
 }

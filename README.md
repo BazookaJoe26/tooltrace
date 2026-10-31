@@ -79,6 +79,12 @@ cargo run --bin tooltrace -- --input photo.jpg
 # Output only SVG
 cargo run --bin tooltrace -- --input photo.jpg --format svg --output trace
 
+# Retry with smoothing only if the first pass does not find all four corner tags
+cargo run --bin tooltrace -- --input photo.jpg --detection-smoothing
+
+# Optionally limit the resolution used for tag detection
+cargo run --bin tooltrace -- --input photo.jpg --detection-max-dimension 1920 --detection-smoothing
+
 # All options
 tooltrace --input <IMAGE> [OPTIONS]
   -i, --input <FILE>         Input image file (required)
@@ -86,7 +92,104 @@ tooltrace --input <IMAGE> [OPTIONS]
   -f, --format <FORMAT>      svg, dxf, or both [default: both]
   -d, --debug                Save intermediate visualizations
   -t, --tag-size <MM>        AprilTag size in millimeters [default: 40.0]
+      --detection-max-dimension <PX>  Limit longest image side for tag detection [default: native]
+      --detection-smoothing           Allow a second detection pass with 1 px smoothing [default: off]
+      --fastsam-model <ONNX>          Override automatic FastSAM model discovery
+      --no-attachments               Disable recovery of small attached FastSAM parts
 ```
+
+**Install FastSAM from a local clone (Windows):**
+
+```powershell
+.\scripts\setup-fastsam.ps1 -Repository C:\repos\FastSAM
+.\target\debug\tooltrace.exe --input photo.jpg
+```
+
+Setup creates an isolated export environment under `target/fastsam-env` and
+installs the validated FastSAM-x ONNX model in `models/FastSAM-x.onnx`.
+ToolTrace automatically searches `models/` beside the executable and in its
+parent directories, then the working directory and its parents. It uses DirectML
+when available, with CPU fallback. Python is not required during tracing.
+An explicit `--fastsam-model` path takes priority, followed by the
+`TOOLTRACE_FASTSAM_MODEL` environment variable. See [model setup details](models/README.md)
+for FastSAM-s, portable deployment, and recorded model hashes/package versions.
+
+The model image uses aspect-preserving padding; boxes and full-resolution masks
+are mapped back after removing that padding. Final contour processing uses the
+original rectified image. `--debug` saves `_fastsam_masks.jpg` and
+`_fastsam_contours.jpg`. If no model is installed, the log explicitly identifies
+the edge-based fallback. Finding a model does not guarantee dimensional accuracy;
+printed-axis validation and contour review remain necessary.
+
+By default, small FastSAM instances that overlap the original main object are
+considered as attachments. A candidate must add meaningful exterior area, overlap
+at least 5% of its own mask with the original object, cover at most 5% of the main
+object's area, and fit within 20 mm. Compactness, image bounds, AprilTag exclusion,
+and a connected final union provide additional checks. Nearby disconnected
+objects and chains of neighboring masks are not merged. This recovers separately
+segmented knobs/wheels without expanding the whole silhouette. Attachments are
+merged after straight-line regularization to preserve their small curves.
+`--no-attachments` disables this step; `--debug` saves an `_attachments.jpg`
+overlay when parts were recovered. Two distinct objects that physically overlap
+can still require manual review.
+
+Tag detection uses native resolution by default, including inside the AprilTag
+decoder. `--detection-max-dimension` only shrinks images larger than the requested
+limit. Detected positions are mapped back to original image coordinates using
+the actual resized width and height.
+
+If the decoder misses corner tags, an additional native-resolution contour
+search supplies quadrilateral candidates. Their actual 36h11 bit patterns are
+decoded and their corners refined against the original detection pixels. This
+search does not resize or blur the image and is part of the first detection pass.
+
+With `--detection-smoothing`, the first pass always uses the unblurred image. If
+the four corner IDs of a supported paper are incomplete, a second pass uses
+Gaussian smoothing (sigma 1 pixel at the selected detection resolution). Missing
+IDs are added to the first results; existing marker positions are preserved.
+These options only preprocess the image used for detection; perspective
+correction and contour extraction continue using the original image.
+
+Object selection prioritizes foreground area and position rather than circularity,
+so elongated tools are retained instead of small printed scale marks. When using
+the edge-based fallback, the selected outline seeds foreground/background
+refinement at native pixel resolution. This separates interior printing from
+the outer silhouette. `--debug` also saves a `_refined_contour.jpg` overlay.
+Spline controls preserve corners and use bounded pixel spacing to avoid deleting
+jaws or bending long straight sides.
+
+Long, sharp image edges also guide shadow-boundary correction. The line detector
+works at scale 1.0; matching is restricted to nearby contour runs and less than
+half the local object thickness. Short weak gaps can be joined, while strong
+notches and rounded features remain separate. Nearly straight runs at least
+8 mm long are regularized using a 0.6 mm line-fit tolerance; tangent changes
+protect visible arcs. `--debug` saves a `_linearized_contour.jpg` overlay.
+
+DXF export converts image Y-down coordinates to CAD Y-up coordinates so the
+outline has the same visible orientation as the photo/SVG. The conversion uses
+one shared center for all contours, preserving their relative placement.
+
+Calibration jointly fits all 16 black-square marker corners with a normalized
+homography and Huber weighting (0.35 mm threshold in paper coordinates). The
+projected marker centers initialize corner assignment; paper IDs determine the
+orientation. Physical target coordinates retain fractional pixels; only the
+output canvas bounds are rounded. The console reports each corner's fitting
+residual, the overall RMS/maximum, and the number of downweighted corners.
+
+After warping, ToolTrace automatically checks the optional printed measurement
+axes. It detects the axis strokes, both end ticks, and at least 70% of the cross
+ticks, then reports measured lengths and deviations. These observations never
+rescale the calibration. Missing, obscured, or inconsistent rulers are reported
+as **not verified**; deviations over 0.50 mm are marked **outside tolerance**.
+Ruler positions and lengths follow the detected paper size and `--tag-size`.
+Results are saved to `<output>_calibration.txt`; `--debug` also writes
+`<output>_measurement_axes.jpg` and annotated marker-corner images.
+
+Fitting residuals are not independent validation. Remaining mismatches can
+indicate image distortion, a curved sheet, or inaccurate corner detection. The
+ruler check concerns the paper plane; objects above that plane can still appear
+enlarged, and physical print dimensions must be checked separately. The 300 DPI
+output setting alone does not guarantee measurement accuracy.
 
 **Implemented Features:**
 - ✓ AprilTag detection for perspective correction (OpenCV + apriltag-rust)

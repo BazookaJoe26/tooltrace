@@ -10,30 +10,41 @@ use opencv::{
 };
 use tooltrace_common::{Contour, Point2DMm};
 
+pub struct SegmentationResult {
+    pub contours: Vec<Contour>,
+    pub edge_based: bool,
+}
+
 /// Segment objects from the flattened paper image using FastSAM or edge detection fallback
-/// Provides accurate instance segmentation regardless of tool color (handles white/dark tools)
+/// Uses the installed model when available, otherwise an explicit edge fallback.
 /// Excludes AprilTag regions and returns only outer boundary contours for tool storage plate generation
 pub fn segment_object(
     flattened_image: &RgbImage,
     tag_regions: &[(i32, i32, i32, i32)], // (x, y, width, height) in pixels at 300 DPI
+    model_override: Option<&std::path::Path>,
     debug_path: Option<&str>,
-) -> Result<Vec<Contour>> {
+) -> Result<SegmentationResult> {
     // Try FastSAM first (best for segmenting all objects), fallback to edge detection
-    let fastsam_path = "d:/data/FastSam-S.onnx";
-    if std::path::Path::new(fastsam_path).exists() {
-        println!("Using FastSAM model for segmentation");
-        return segment_with_fastsam(flattened_image, fastsam_path, tag_regions, debug_path);
+    if let Some(fastsam_path) = crate::fastsam::find_model(model_override)? {
+        println!("Using FastSAM model for segmentation: {}", fastsam_path.display());
+        return Ok(SegmentationResult {
+            contours: segment_with_fastsam(flattened_image, &fastsam_path, tag_regions, debug_path)?,
+            edge_based: false,
+        });
     }
 
     println!("No ML models found, using edge detection fallback");
-    segment_with_edges(flattened_image, tag_regions, debug_path)
+    Ok(SegmentationResult {
+        contours: segment_with_edges(flattened_image, tag_regions, debug_path)?,
+        edge_based: true,
+    })
 }
 
 /// FastSAM based segmentation using ONNX Runtime
 /// FastSAM (Fast Segment Anything Model) segments all objects in the image without class labels
 fn segment_with_fastsam(
     flattened_image: &RgbImage,
-    model_path: &str,
+    model_path: &std::path::Path,
     tag_regions: &[(i32, i32, i32, i32)],
     debug_path: Option<&str>,
 ) -> Result<Vec<Contour>> {
@@ -42,7 +53,7 @@ fn segment_with_fastsam(
     use ort::value::TensorRef;
     use ndarray::Array;
 
-    println!("Loading FastSAM model with ONNX Runtime from: {}", model_path);
+    println!("Loading FastSAM model with ONNX Runtime from: {}", model_path.display());
 
     let img_height = flattened_image.height() as i32;
     let img_width = flattened_image.width() as i32;
@@ -50,27 +61,34 @@ fn segment_with_fastsam(
     println!("Input image size: {}x{}", img_width, img_height);
 
     // Create ONNX Runtime session with GPU acceleration
-    let mut session = Session::builder()?
-        .with_execution_providers([
-            DirectMLExecutionProvider::default().build(), // Try DirectML first (any DX12 GPU)
-        ])?
-        .with_intra_threads(4)?
-        .commit_from_file(model_path)?;
+    let build_session = |gpu: bool| -> ort::Result<Session> {
+        let mut builder = Session::builder()?.with_parallel_execution(false)?.with_intra_threads(4)?;
+        if gpu {
+            builder = builder.with_memory_pattern(false)?.with_execution_providers([
+                DirectMLExecutionProvider::default().build().error_on_failure(),
+            ])?;
+        }
+        builder.commit_from_file(model_path)
+    };
+    let mut session = match build_session(true) {
+        Ok(session) => { println!("FastSAM execution provider: DirectML"); session }
+        Err(error) => { println!("DirectML unavailable ({error}); loading FastSAM on CPU"); build_session(false)? }
+    };
 
-    println!("ONNX Runtime session created with GPU acceleration (DirectML)");
-
-    // FastSAM expects 1024x1024 input (or sometimes 640x640, we'll try 1024 first)
-    let input_size = 1024;
+    // Honor a static square input size; dynamic exports default to 1024.
+    let input_shape = session.inputs.first().and_then(|i| i.input_type.tensor_shape())
+        .ok_or_else(|| anyhow::anyhow!("FastSAM model needs an image tensor input"))?;
+    if input_shape.len() != 4 || input_shape[1] != 3 || (input_shape[2] > 0 && input_shape[3] > 0 && input_shape[2] != input_shape[3]) {
+        anyhow::bail!("Expected FastSAM input [1,3,size,size], got {input_shape:?}");
+    }
+    let input_size = if input_shape[2] > 0 { input_shape[2] as usize } else { 1024 };
 
     // Prepare input: resize and normalize
-    let resized = image::imageops::resize(
-        flattened_image,
-        input_size as u32,
-        input_size as u32,
-        image::imageops::FilterType::Triangle,
-    );
+    let letterbox = crate::fastsam::Letterbox::new(flattened_image.width(), flattened_image.height(), input_size as u32);
+    let resized = letterbox.prepare(flattened_image);
+    println!("FastSAM input: {}x{}, aspect ratio preserved (padding {}, {})", input_size, input_size, letterbox.left, letterbox.top);
 
-    // Convert to ndarray format: [1, 3, 1024, 1024] with CHW layout
+    // Convert to an RGB float32 BCHW tensor.
     let mut input_array = Array::zeros((1, 3, input_size, input_size));
 
     for y in 0..input_size {
@@ -88,7 +106,8 @@ fn segment_with_fastsam(
     println!("Running FastSAM inference with ONNX Runtime...");
 
     let input_tensor = TensorRef::from_array_view(&input_array)?;
-    let outputs = session.run(ort::inputs!["images" => input_tensor])?;
+    let input_name = session.inputs[0].name.clone();
+    let outputs = session.run(ort::inputs![input_name.as_str() => input_tensor])?;
 
     println!("Got {} output tensors", outputs.len());
 
@@ -115,7 +134,10 @@ fn segment_with_fastsam(
     let source_mat = if contour_debug_path.is_some() || masks_debug_path.is_some() {
         let img_data: Vec<u8> = flattened_image.as_raw().clone();
         let mat = Mat::from_slice(&img_data)?;
-        Some(mat.reshape(3, img_height)?.try_clone()?)
+        let rgb = mat.reshape(3, img_height)?;
+        let mut bgr = Mat::default();
+        opencv::imgproc::cvt_color_def(&rgb, &mut bgr, opencv::imgproc::COLOR_RGB2BGR)?;
+        Some(bgr)
     } else {
         None
     };
@@ -124,7 +146,7 @@ fn segment_with_fastsam(
         &outputs,
         img_width,
         img_height,
-        input_size as i32,
+        letterbox,
         tag_regions,
         contour_debug_path.as_deref(),
         masks_debug_path.as_deref(),
@@ -332,7 +354,7 @@ fn process_fastsam_outputs(
     outputs: &ort::session::SessionOutputs,
     img_width: i32,
     img_height: i32,
-    input_size: i32,
+    letterbox: crate::fastsam::Letterbox,
     tag_regions: &[(i32, i32, i32, i32)],
     contour_debug_path: Option<&str>,
     masks_debug_path: Option<&str>,
@@ -347,9 +369,9 @@ fn process_fastsam_outputs(
     // output1: shape [1, 32, H, W] - mask prototypes
 
     // Tunable parameters for FastSAM segmentation
-    let conf_threshold = 0.50f32;      // Confidence threshold: higher = more selective, fewer false positives
-    let nms_threshold = 0.45f32;       // NMS IoU threshold
-    let mask_threshold = 0.5f32;       // Mask binarization threshold
+    let conf_threshold = 0.40f32;      // FastSAM README defaults
+    let nms_threshold = 0.90f32;
+    let mask_threshold = 0.0f32;       // Native mask logits > 0 (sigmoid > 0.5)
 
     // Area-based filtering to remove background and noise
     let total_pixels = (img_width * img_height) as f32;
@@ -359,6 +381,7 @@ fn process_fastsam_outputs(
     println!("Area filtering: min={:.0} pixels, max={:.0} pixels", min_area_pixels, max_area_pixels);
 
     // Extract detection tensor (output0)
+    if outputs.len() != 2 { anyhow::bail!("FastSAM requires detection and mask-prototype outputs"); }
     let det_value = &outputs[0];
     let det_tensor = det_value.try_extract_tensor::<f32>()?;
     let det_shape = det_tensor.0;
@@ -374,8 +397,8 @@ fn process_fastsam_outputs(
 
     println!("Mask prototypes shape: {:?}", proto_shape);
 
-    if det_shape.len() < 3 {
-        anyhow::bail!("Expected 3D detections tensor, got {:?}", det_shape);
+    if det_shape.len() != 3 || det_shape[0] != 1 || det_shape[1] != 37 || proto_shape.len() != 4 || proto_shape[0] != 1 || proto_shape[1] != 32 {
+        anyhow::bail!("Expected FastSAM outputs [1,37,N] and [1,32,H,W], got {det_shape:?} and {proto_shape:?}");
     }
 
     // Create ArrayViews
@@ -406,21 +429,16 @@ fn process_fastsam_outputs(
 
     let mut detections_list = Vec::new();
 
-    let x_scale = img_width as f32 / input_size as f32;
-    let y_scale = img_height as f32 / input_size as f32;
-
     // Process each detection
     for i in 0..num_detections {
         // Extract box coordinates [cx, cy, w, h] (indices 0-3)
-        let cx = det_view[[0, 0, i]] * x_scale;
-        let cy = det_view[[0, 1, i]] * y_scale;
-        let w = det_view[[0, 2, i]] * x_scale;
-        let h = det_view[[0, 3, i]] * y_scale;
+        let (cx, cy) = letterbox.point_to_original(det_view[[0, 0, i]], det_view[[0, 1, i]]);
+        let (w, h) = letterbox.size_to_original(det_view[[0, 2, i]], det_view[[0, 3, i]]);
 
         // Extract objectness score (index 4)
         let objectness = det_view[[0, 4, i]];
 
-        if objectness > conf_threshold {
+        if objectness.is_finite() && objectness > conf_threshold && [cx, cy, w, h].iter().all(|v| v.is_finite()) && w > 0.0 && h > 0.0 {
             // Extract 32 mask coefficients (indices 5-36)
             let mut mask_coeffs = Vec::with_capacity(32);
             for j in 0..32 {
@@ -521,6 +539,7 @@ fn process_fastsam_outputs(
         let y1 = (det.bbox.1 - det.bbox.3 / 2.0).max(0.0) as i32;
         let x2 = (det.bbox.0 + det.bbox.2 / 2.0).min(img_width as f32) as i32;
         let y2 = (det.bbox.1 + det.bbox.3 / 2.0).min(img_height as f32) as i32;
+        if x2 <= x1 || y2 <= y1 { continue; }
 
         // Check if overlaps with AprilTag regions
         let mut overlaps_tag = false;
@@ -550,7 +569,7 @@ fn process_fastsam_outputs(
         }
 
         // Generate segmentation mask from coefficients and prototypes
-        // Mask = sigmoid(sum(coeffs[i] * prototypes[i]))
+        // Mask logits = sum(coeffs[i] * prototypes[i]).
         let mut mask = vec![0.0f32; proto_h * proto_w];
 
         for proto_idx in 0..32 {
@@ -568,28 +587,18 @@ fn process_fastsam_outputs(
         let mask_max = mask.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         println!("  Mask before sigmoid: min={:.3}, max={:.3}", mask_min, mask_max);
 
-        // Apply sigmoid activation
-        for val in mask.iter_mut() {
-            *val = 1.0 / (1.0 + (-*val).exp());
-        }
-
-        // Debug: Check mask values after sigmoid
-        let sig_min = mask.iter().copied().fold(f32::INFINITY, f32::min);
-        let sig_max = mask.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        println!("  Mask after sigmoid: min={:.3}, max={:.3}", sig_min, sig_max);
-
-        // Resize mask from proto_h x proto_w to full image size
+        // Restore logits at original resolution before thresholding, matching
+        // retina-mask decoding. Remove the input padding before resizing.
         let mask_mat_temp = Mat::from_slice(&mask)?;
         let mask_mat = mask_mat_temp.reshape(1, proto_h as i32)?;
-        let mut resized_mask = Mat::default();
-        opencv::imgproc::resize(
-            &mask_mat,
-            &mut resized_mask,
-            opencv::core::Size::new(img_width, img_height),
-            0.0,
-            0.0,
-            opencv::imgproc::INTER_LINEAR,
-        )?;
+        let mut resized_mask = letterbox.restore_mask(&mask_mat)?;
+        // A prototype describes the whole scene. Each instance is restricted
+        // to its own detected box, so unrelated positive regions cannot leak in.
+        for (index, value) in opencv::prelude::MatTraitManual::data_typed_mut::<f32>(&mut resized_mask)?.iter_mut().enumerate() {
+            let x = index as i32 % img_width;
+            let y = index as i32 / img_width;
+            if x < x1 || x >= x2 || y < y1 || y >= y2 { *value = -100.0; }
+        }
 
         // Debug: Check resized mask values
         let mut min_val = 0.0;
@@ -604,12 +613,12 @@ fn process_fastsam_outputs(
         )?;
         println!("  Resized mask: min={:.3}, max={:.3}", min_val, max_val);
 
-        // Threshold mask to create binary mask (values are in [0,1] range)
+        // Threshold native-resolution logits at zero (probability 0.5).
         let mut binary_mask = Mat::default();
         opencv::imgproc::threshold(
             &resized_mask,
             &mut binary_mask,
-            mask_threshold as f64,  // Threshold directly since mask is in [0,1] range
+            mask_threshold as f64,
             1.0,                     // Max value is 1.0
             opencv::imgproc::THRESH_BINARY,
         )?;
@@ -898,7 +907,7 @@ pub fn pixels_to_mm(contours: Vec<Contour>, dpi: f64) -> Vec<Contour> {
 }
 
 /// Filter contours to keep only the best object contour using smart scoring
-/// Considers area, centrality, compactness, and edge proximity
+/// Considers area, centrality and edge proximity without rejecting elongated tools.
 /// Returns a vector with at most one contour (the best object)
 pub fn filter_largest_contour(
     contours: Vec<Contour>,
@@ -908,11 +917,6 @@ pub fn filter_largest_contour(
     if contours.is_empty() {
         println!("No contours to filter");
         return Ok(vec![]);
-    }
-
-    if contours.len() == 1 {
-        println!("Only one contour, keeping it");
-        return Ok(contours);
     }
 
     println!("Filtering {} contours using smart object scoring...", contours.len());
@@ -926,7 +930,19 @@ pub fn filter_largest_contour(
     let mut contour_scores: Vec<(usize, f64, ContourMetrics)> = Vec::new();
 
     for (idx, contour) in contours.iter().enumerate() {
+        if contour.points.len() < 3 || contour.points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+            continue;
+        }
         let metrics = calculate_contour_metrics(&contour.points, img_width, img_height);
+        if metrics.area <= f64::EPSILON {
+            continue;
+        }
+        let bbox_width = metrics.bbox.2 - metrics.bbox.0;
+        let bbox_height = metrics.bbox.3 - metrics.bbox.1;
+        if bbox_width >= img_width * 0.95 && bbox_height >= img_height * 0.95 {
+            println!("  Contour {}: REJECTED (spans the paper boundary)", idx);
+            continue;
+        }
 
         // Calculate composite score
         let area_score = calculate_area_score(metrics.area, img_width * img_height);
@@ -938,27 +954,19 @@ pub fn filter_largest_contour(
             img_width,
             img_height
         );
-        let compactness_score = metrics.compactness;
         let edge_proximity_score = calculate_edge_proximity_score(
             &metrics.bbox,
             img_width,
             img_height
         );
 
-        // Filter out highly irregular contours (paper edges/creases have very low compactness)
-        if metrics.compactness < 0.15 {
-            // Skip this contour - too irregular, likely paper edge/crease/shadow
-            println!("    REJECTED: compactness too low ({:.3}), likely paper artifact", metrics.compactness);
-            continue;
-        }
-
-        // Weighted composite score (tuned for tool/object detection)
-        // Heavy emphasis on compactness to reject paper edges/creases
+        // Circularity is not an object-quality measure: calipers, rulers and
+        // other long/concave tools naturally have low circularity. Prioritize
+        // substantial foreground area over small round printed scale glyphs.
         let total_score =
-            area_score * 0.15 +           // Area is less important when we have shape info
-            centrality_score * 0.25 +     // Centered objects are preferred
-            compactness_score * 0.50 +    // STRONG preference for compact shapes (rejects paper edges)
-            edge_proximity_score * 0.10;  // Penalize contours near image edges
+            area_score * 0.60 +
+            centrality_score * 0.25 +
+            edge_proximity_score * 0.15;
 
         contour_scores.push((idx, total_score, metrics));
 
@@ -968,10 +976,12 @@ pub fn filter_largest_contour(
     }
 
     // Find the best scoring contour
-    let (best_idx, best_score, best_metrics) = contour_scores
+    let Some((best_idx, best_score, best_metrics)) = contour_scores
         .iter()
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-        .unwrap();
+        .max_by(|a, b| a.1.total_cmp(&b.1)) else {
+            println!("No valid object contours after filtering");
+            return Ok(vec![]);
+        };
 
     println!("Best contour: index {} with score {:.3} (area={:.1}px², center=({:.0},{:.0}))",
         best_idx, best_score, best_metrics.area, best_metrics.centroid_x, best_metrics.centroid_y);
@@ -983,6 +993,111 @@ pub fn filter_largest_contour(
 
     // Return only the best contour
     Ok(vec![contours[*best_idx].clone()])
+}
+
+/// Refine an edge-derived outline using foreground/background colors. The edge
+/// contour seeds the mask; ambiguous boundary pixels can move in either direction
+/// while printed interior details no longer become deep exterior indentations.
+pub fn refine_edge_contours(
+    contours: Vec<Contour>,
+    source_image: &RgbImage,
+    tag_regions: &[(i32, i32, i32, i32)],
+    debug_path: Option<&str>,
+) -> Result<Vec<Contour>> {
+    let mut refined = Vec::new();
+    for contour in contours {
+        refined.push(refine_edge_contour(&contour, source_image, tag_regions)?);
+    }
+    if let Some(path) = debug_path {
+        if !refined.is_empty() {
+            save_best_contour_debug(&refined, 0, source_image, path)?;
+        }
+    }
+    Ok(refined)
+}
+
+fn refine_edge_contour(
+    contour: &Contour,
+    source_image: &RgbImage,
+    tag_regions: &[(i32, i32, i32, i32)],
+) -> Result<Contour> {
+    use opencv::{core::{Rect, Size, CV_8UC1}, prelude::*};
+    let polygon: Vector<Point> = contour.points.iter()
+        .map(|p| Point::new(p.x.round() as i32, p.y.round() as i32)).collect();
+    let bounds = opencv::imgproc::bounding_rect(&polygon)?;
+    // Work on an 8 mm neighborhood at the calibrated 300 DPI, keeping native pixels.
+    let padding = (8.0_f64 * 300.0 / 25.4).round() as i32;
+    let x = (bounds.x - padding).max(0);
+    let y = (bounds.y - padding).max(0);
+    let right = (bounds.x + bounds.width + padding).min(source_image.width() as i32);
+    let bottom = (bounds.y + bounds.height + padding).min(source_image.height() as i32);
+    let roi = Rect::new(x, y, right - x, bottom - y);
+    if roi.width < 3 || roi.height < 3 {
+        return Ok(contour.clone());
+    }
+    let mat = Mat::from_slice(source_image.as_raw())?;
+    let mat = mat.reshape(3, source_image.height() as i32)?;
+    let crop = Mat::roi(&mat, roi)?.try_clone()?;
+
+    let local_polygon: Vector<Point> = polygon.iter().map(|p| Point::new(p.x - x, p.y - y)).collect();
+    let local_contours = Vector::<Vector<Point>>::from_iter([local_polygon]);
+    let mut filled = Mat::new_rows_cols_with_default(roi.height, roi.width, CV_8UC1, Scalar::all(0.0))?;
+    opencv::imgproc::draw_contours(&mut filled, &local_contours, 0, Scalar::all(255.0), -1,
+        opencv::imgproc::LINE_8, &Mat::default(), i32::MAX, Point::new(0, 0))?;
+    let mut labels = Mat::new_rows_cols_with_default(roi.height, roi.width, CV_8UC1,
+        Scalar::all(opencv::imgproc::GC_PR_BGD as f64))?;
+    labels.set_to(&Scalar::all(opencv::imgproc::GC_PR_FGD as f64), &filled)?;
+    let erosion_kernel = opencv::imgproc::get_structuring_element(opencv::imgproc::MORPH_ELLIPSE,
+        Size::new(9, 9), Point::new(-1, -1))?;
+    let mut interior = Mat::default();
+    opencv::imgproc::erode(&filled, &mut interior, &erosion_kernel, Point::new(-1, -1), 1,
+        BORDER_DEFAULT, Scalar::default())?;
+    labels.set_to(&Scalar::all(opencv::imgproc::GC_FGD as f64), &interior)?;
+    opencv::imgproc::rectangle(&mut labels, Rect::new(0, 0, roi.width, roi.height),
+        Scalar::all(opencv::imgproc::GC_BGD as f64), 2, opencv::imgproc::LINE_8, 0)?;
+    for &(tx, ty, tw, th) in tag_regions {
+        let overlap = Rect::new(tx, ty, tw, th) & roi;
+        if overlap.area() > 0 {
+            opencv::imgproc::rectangle(&mut labels,
+                Rect::new(overlap.x - x, overlap.y - y, overlap.width, overlap.height),
+                Scalar::all(opencv::imgproc::GC_BGD as f64), -1, opencv::imgproc::LINE_8, 0)?;
+        }
+    }
+    opencv::imgproc::grab_cut(&crop, &mut labels, Rect::default(), &mut Mat::default(),
+        &mut Mat::default(), 5, opencv::imgproc::GC_INIT_WITH_MASK)?;
+    let foreground: Vec<u8> = labels.data_typed::<u8>()?.iter().map(|&v| {
+        if v == opencv::imgproc::GC_FGD as u8 || v == opencv::imgproc::GC_PR_FGD as u8 { 255 } else { 0 }
+    }).collect();
+    let foreground_mat = Mat::from_slice(&foreground)?;
+    let foreground_mat = foreground_mat.reshape(1, roi.height)?;
+    let kernel = opencv::imgproc::get_structuring_element(opencv::imgproc::MORPH_RECT,
+        Size::new(3, 3), Point::new(-1, -1))?;
+    let mut closed = Mat::default();
+    opencv::imgproc::morphology_ex(&foreground_mat, &mut closed, opencv::imgproc::MORPH_CLOSE,
+        &kernel, Point::new(-1, -1), 1, BORDER_DEFAULT, Scalar::default())?;
+    let mut candidates: Vector<Vector<Point>> = Vector::new();
+    opencv::imgproc::find_contours(&closed, &mut candidates, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE, Point::new(x, y))?;
+    let mut best = None;
+    let mut best_area = 0.0;
+    for candidate in candidates {
+        let area = opencv::imgproc::contour_area(&candidate, false)?;
+        if area > best_area {
+            best_area = area;
+            best = Some(candidate);
+        }
+    }
+    let original_area = calculate_contour_area(&contour.points);
+    if best_area < original_area * 0.5 || best_area > original_area * 4.0 {
+        println!("Foreground refinement was inconclusive; retaining the edge outline");
+        return Ok(contour.clone());
+    }
+    match best {
+        Some(points) => Ok(Contour {
+            points: points.iter().map(|p| Point2DMm::new(p.x as f64, p.y as f64)).collect(),
+            closed: true,
+        }),
+        None => Ok(contour.clone()),
+    }
 }
 
 /// Metrics for evaluating contour quality
@@ -1194,4 +1309,71 @@ fn save_best_contour_debug(
     println!("Saved best contour debug image to: {}", path);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rectangle(x: f64, y: f64, width: f64, height: f64) -> Contour {
+        Contour {
+            points: vec![
+                Point2DMm::new(x, y), Point2DMm::new(x + width, y),
+                Point2DMm::new(x + width, y + height), Point2DMm::new(x, y + height),
+            ],
+            closed: true,
+        }
+    }
+
+    #[test]
+    fn selects_elongated_tool_over_small_compact_scale_marks() {
+        let img = RgbImage::new(1000, 1000);
+        let tool = rectangle(480.0, 100.0, 40.0, 800.0);
+        assert!(calculate_contour_metrics(&tool.points, 1000.0, 1000.0).compactness < 0.15);
+        let selected = filter_largest_contour(vec![
+            rectangle(150.0, 500.0, 10.0, 10.0), tool.clone(),
+            rectangle(0.0, 0.0, 999.0, 999.0),
+        ], None, &img).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].points, tool.points);
+    }
+
+    #[test]
+    fn no_valid_candidate_returns_empty_without_panicking() {
+        let img = RgbImage::new(1000, 1000);
+        let mut invalid = rectangle(0.0, 0.0, 10.0, 10.0);
+        invalid.points[0].x = f64::NAN;
+        assert!(filter_largest_contour(vec![
+            invalid, rectangle(20.0, 20.0, 0.0, 100.0),
+            rectangle(0.0, 0.0, 999.0, 999.0),
+        ], None, &img).unwrap().is_empty());
+    }
+
+    #[test]
+    fn foreground_refinement_recovers_missing_outline_without_filling_concavities() {
+        let mut img = RgbImage::from_pixel(200, 300, image::Rgb([240; 3]));
+        for (x, y, w, h) in [(80, 50, 40, 210), (60, 30, 80, 40), (10, 270, 5, 5)] {
+            for py in y..y + h {
+                for px in x..x + w {
+                    img.put_pixel(px, py, image::Rgb([60, 70, 80]));
+                }
+            }
+        }
+        let refined = refine_edge_contours(vec![rectangle(85.0, 50.0, 30.0, 205.0)],
+            &img, &[], None).unwrap();
+        assert_eq!(refined.len(), 1);
+        let metrics = calculate_contour_metrics(&refined[0].points, 200.0, 300.0);
+        for (actual, expected) in [
+            (metrics.bbox.0, 60.0), (metrics.bbox.1, 30.0),
+            (metrics.bbox.2, 139.0), (metrics.bbox.3, 259.0),
+        ] {
+            assert!((actual - expected).abs() <= 1.0);
+        }
+        let polygon: Vector<Point> = refined[0].points.iter()
+            .map(|p| Point::new(p.x as i32, p.y as i32)).collect();
+        assert!(opencv::imgproc::point_polygon_test(&polygon,
+            opencv::core::Point2f::new(65.0, 50.0), false).unwrap() > 0.0);
+        assert!(opencv::imgproc::point_polygon_test(&polygon,
+            opencv::core::Point2f::new(70.0, 100.0), false).unwrap() < 0.0);
+    }
 }

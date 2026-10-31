@@ -1,5 +1,8 @@
 # Rust build artifacts
 /target
+/models/*.onnx
+/models/*.pt
+/models/*.json
 Cargo.lock
 
 # Output files

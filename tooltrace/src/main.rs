@@ -4,11 +4,16 @@ use tooltrace_common::{OutputFormat, DEFAULT_TAG_SIZE_MM};
 
 mod detection;
 mod calibration;
+mod calibration_fit;
+mod measurement;
 mod segmentation;
+mod fastsam;
+mod attachments;
 mod tracing;
 mod export_svg;
 mod export_dxf;
 mod smoothing;
+mod geometry;
 
 /// Analyze photographs of objects on calibration paper and generate vector traces
 #[derive(Parser, Debug)]
@@ -34,6 +39,22 @@ struct Args {
     /// AprilTag size in millimeters (outer black square)
     #[arg(short, long, default_value_t = DEFAULT_TAG_SIZE_MM)]
     tag_size: f64,
+
+    /// Limit the longest image side for tag detection (default: native resolution)
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    detection_max_dimension: Option<u32>,
+
+    /// Retry incomplete tag detection with 1 px Gaussian smoothing
+    #[arg(long)]
+    detection_smoothing: bool,
+
+    /// FastSAM ONNX model (default: automatically search models/ near the executable)
+    #[arg(long)]
+    fastsam_model: Option<std::path::PathBuf>,
+
+    /// Disable recovery of small FastSAM parts attached to the main object
+    #[arg(long)]
+    no_attachments: bool,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -50,6 +71,27 @@ impl From<FormatArg> for OutputFormat {
             FormatArg::Dxf => OutputFormat::Dxf,
             FormatArg::Both => OutputFormat::Both,
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn detection_preprocessing_is_opt_in() {
+        let args = Args::try_parse_from(["tooltrace", "--input", "photo.jpg"]).unwrap();
+        assert_eq!(args.detection_max_dimension, None);
+        assert!(!args.detection_smoothing);
+        let args = Args::try_parse_from([
+            "tooltrace", "--input", "photo.jpg", "--detection-max-dimension", "1920",
+            "--detection-smoothing",
+        ]).unwrap();
+        assert_eq!(args.detection_max_dimension, Some(1920));
+        assert!(args.detection_smoothing);
+        assert!(Args::try_parse_from([
+            "tooltrace", "--input", "photo.jpg", "--detection-max-dimension", "0",
+        ]).is_err());
     }
 }
 
@@ -72,7 +114,11 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let detections = detection::detect_apriltags(&args.input, debug_path.as_deref())?;
+    let detection_options = detection::DetectionOptions {
+        max_dimension: args.detection_max_dimension,
+        smoothing: args.detection_smoothing,
+    };
+    let detections = detection::detect_apriltags(&args.input, detection_options, debug_path.as_deref())?;
 
     if detections.is_empty() {
         anyhow::bail!("No AprilTags detected in the image. Make sure the calibration paper is visible.");
@@ -107,6 +153,27 @@ fn main() -> Result<()> {
     let flattened_path = format!("{}_flattened.jpg", args.output);
     flattened.save(&flattened_path)?;
     println!("Saved flattened image to: {}", flattened_path);
+
+    let axis_checks = measurement::check_measurement_axes(
+        &flattened, calibration.paper_size, args.tag_size,
+    )?;
+    let axis_report = measurement::report(&axis_checks);
+    println!("\n{axis_report}");
+    let fit_status = if calibration.fit_max_mm > measurement::TOLERANCE_MM {
+        "Remaining marker mismatch exceeds 0.50 mm; a ruler result within tolerance does not validate the whole image.\n"
+    } else {
+        "Marker fitting residuals are within 0.50 mm; these are not independent validation.\n"
+    };
+    println!("{fit_status}");
+    let calibration_report = format!(
+        "Input: {}\n{}\n{}\n{}",
+        args.input, calibration.fit_report, fit_status, axis_report);
+    std::fs::write(format!("{}_calibration.txt", args.output), calibration_report)?;
+    if args.debug {
+        measurement::save_overlay(
+            &flattened, &axis_checks, &format!("{}_measurement_axes.jpg", args.output),
+        )?;
+    }
 
     // Step 4: Segment objects from the flattened image
     println!("\nStep 4: Segmenting objects...");
@@ -156,7 +223,8 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let contours_pixels = segmentation::segment_object(&flattened, &tag_regions, debug_contours_path.as_deref())?;
+    let segmented = segmentation::segment_object(&flattened, &tag_regions, args.fastsam_model.as_deref(), debug_contours_path.as_deref())?;
+    let contours_pixels = segmented.contours;
 
     if contours_pixels.is_empty() {
         println!("\nNo contours detected. Try adjusting the object placement or lighting.");
@@ -164,6 +232,9 @@ fn main() -> Result<()> {
     }
 
     println!("Found {} contour(s) in total", contours_pixels.len());
+    let part_candidates = if !segmented.edge_based && !args.no_attachments {
+        contours_pixels.clone()
+    } else { Vec::new() };
 
     // Step 5a: Export multi-color SVG with all contours (debug visualization)
     if args.debug && contours_pixels.len() > 1 {
@@ -181,7 +252,7 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let largest_contour_pixels = segmentation::filter_largest_contour(
+    let mut largest_contour_pixels = segmentation::filter_largest_contour(
         contours_pixels,
         largest_debug_path.as_deref(),
         &flattened,
@@ -191,10 +262,34 @@ fn main() -> Result<()> {
         println!("\nNo valid contour after filtering.");
         return Ok(());
     }
+    let original_primary = if part_candidates.is_empty() { Vec::new() } else { largest_contour_pixels.clone() };
+
+    if segmented.edge_based {
+        println!("\nRefining the foreground outline...");
+        let refined_debug_path = if args.debug { Some(format!("{}_refined_contour.jpg", args.output)) } else { None };
+        largest_contour_pixels = segmentation::refine_edge_contours(
+            largest_contour_pixels, &flattened, &tag_regions, refined_debug_path.as_deref(),
+        )?;
+    }
+
+    println!("\nAligning and straightening supported object edges...");
+    let linear_debug_path = if args.debug { Some(format!("{}_linearized_contour.jpg", args.output)) } else { None };
+    largest_contour_pixels = geometry::regularize_contours(
+        largest_contour_pixels, &flattened, linear_debug_path.as_deref(),
+    )?;
+
+    if !part_candidates.is_empty() {
+        println!("\nRecovering small attached FastSAM parts...");
+        let attachment_debug = if args.debug { Some(format!("{}_attachments.jpg", args.output)) } else { None };
+        largest_contour_pixels = attachments::complete_attachments(
+            largest_contour_pixels, &original_primary, &part_candidates, &flattened,
+            &tag_regions, attachment_debug.as_deref(),
+        )?;
+    }
 
     // Step 5c: Apply spline smoothing to create gentle low-frequency curves
     println!("\nStep 5c: Applying spline smoothing...");
-    let decimation_factor = 5; // Keep every 5th point for low-frequency representation
+    let control_spacing_pixels = 5; // Maximum distance between spline control points
     let smoothing_debug_path = if args.debug {
         Some(format!("{}_smoothed.jpg", args.output))
     } else {
@@ -202,7 +297,7 @@ fn main() -> Result<()> {
     };
     let smoothed_contours = smoothing::apply_spline_smoothing(
         largest_contour_pixels,
-        decimation_factor,
+        control_spacing_pixels,
         smoothing_debug_path.as_deref(),
         Some(&flattened),
     )?;
