@@ -32,10 +32,10 @@ mod tests {
         let config = AprilTagConfig::default();
         let positions = calculate_marker_positions(PaperSize::A4, &config);
 
-        // A4 is 210x297mm, margin 15mm, tag 50mm
-        assert_eq!(positions[0], (15.0, 232.0)); // top-left
-        assert_eq!(positions[1], (145.0, 232.0)); // top-right
-        assert_eq!(positions[2], (145.0, 15.0)); // bottom-right
+        // A4 is 210x297mm, margin 15mm, tag 40mm
+        assert_eq!(positions[0], (15.0, 242.0)); // top-left
+        assert_eq!(positions[1], (155.0, 242.0)); // top-right
+        assert_eq!(positions[2], (155.0, 15.0)); // bottom-right
         assert_eq!(positions[3], (15.0, 15.0)); // bottom-left
     }
 }

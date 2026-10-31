@@ -30,6 +30,9 @@ Generates printable PDFs with AprilTag fiducial markers and calibration grids.
 # Generate A4 calibration paper
 cargo run --bin paper-gen
 
+# Include X and Y axes between the tags to verify print scaling
+cargo run --bin paper-gen -- --measurement-axes
+
 # Generate US Letter with custom tag size
 cargo run --bin paper-gen -- --size letter --tag-size 60
 
@@ -37,13 +40,21 @@ cargo run --bin paper-gen -- --size letter --tag-size 60
 paper-gen [OPTIONS]
   -o, --output <FILE>        Output PDF path [default: calibration_paper.pdf]
   -s, --size <SIZE>          Paper size: a4, letter, a3 [default: a4]
-  -t, --tag-size <MM>        Outer black square size in millimeters [default: 50.0]
+  -t, --tag-size <MM>        Outer black square size in millimeters [default: 40.0]
+      --measurement-axes   Add X/Y axes between tags with 10 mm ticks [default: off]
 ```
 
-The default black square measures 50 × 50 mm; its white quiet zone adds 6.25 mm
+The default black square measures 40 × 40 mm; its white quiet zone adds 5 mm
 on each side. The black square starts 15 mm from the paper edges. Print at actual
 size (100%), without fitting to the page. Use the same `--tag-size` value for
 `paper-gen` and `tooltrace`.
+
+With `--measurement-axes`, the X axis runs between the centers of the lower
+tags and the Y axis between the centers of the left tags. Each line starts and
+ends 10 mm from its adjacent black tag edges. Labels are numbers only: 0, every
+50 mm, and the endpoint (80 mm in X and 167 mm in Y for A4 with 40 mm tags).
+Measure from each axis's 0 tick to its endpoint to check print scaling.
+Intermediate ticks are 10 mm apart. The axes are omitted unless the flag is supplied.
 
 **Features:**
 - ✓ Supports A4 (210×297mm), US Letter (8.5×11in), and A3 (297×420mm)
@@ -74,7 +85,7 @@ tooltrace --input <IMAGE> [OPTIONS]
   -o, --output <NAME>        Output path without extension [default: output]
   -f, --format <FORMAT>      svg, dxf, or both [default: both]
   -d, --debug                Save intermediate visualizations
-  -t, --tag-size <MM>        AprilTag size in millimeters [default: 50.0]
+  -t, --tag-size <MM>        AprilTag size in millimeters [default: 40.0]
 ```
 
 **Implemented Features:**

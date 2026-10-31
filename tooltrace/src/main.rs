@@ -1,6 +1,6 @@
 use clap::Parser;
 use anyhow::Result;
-use tooltrace_common::OutputFormat;
+use tooltrace_common::{OutputFormat, DEFAULT_TAG_SIZE_MM};
 
 mod detection;
 mod calibration;
@@ -31,8 +31,8 @@ struct Args {
     #[arg(short, long)]
     debug: bool,
 
-    /// AprilTag size in millimeters
-    #[arg(short, long, default_value = "25.0")]
+    /// AprilTag size in millimeters (outer black square)
+    #[arg(short, long, default_value_t = DEFAULT_TAG_SIZE_MM)]
     tag_size: f64,
 }
 

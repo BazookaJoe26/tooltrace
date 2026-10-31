@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// Default side length of the outer black AprilTag square in millimeters.
+pub const DEFAULT_TAG_SIZE_MM: f64 = 40.0;
+
 /// Paper size variants with dimensions in millimeters
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum PaperSize {
@@ -106,7 +109,7 @@ impl AprilTagConfig {
 
 impl Default for AprilTagConfig {
     fn default() -> Self {
-        Self::for_paper_size(PaperSize::A4, 50.0)
+        Self::for_paper_size(PaperSize::A4, DEFAULT_TAG_SIZE_MM)
     }
 }
 

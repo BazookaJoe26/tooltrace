@@ -1,6 +1,6 @@
 use clap::Parser;
 use anyhow::Result;
-use tooltrace_common::PaperSize;
+use tooltrace_common::{PaperSize, DEFAULT_TAG_SIZE_MM};
 
 mod paper_sizes;
 mod pdf_generator;
@@ -23,8 +23,12 @@ struct Args {
     size: PaperSizeArg,
 
     /// Tag size in millimeters (outer black square)
-    #[arg(short, long, default_value = "50.0")]
+    #[arg(short, long, default_value_t = DEFAULT_TAG_SIZE_MM)]
     tag_size: f64,
+
+    /// Add X/Y measurement axes between the tags with 10 mm clearance and ticks
+    #[arg(long)]
+    measurement_axes: bool,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -53,7 +57,7 @@ fn main() -> Result<()> {
     println!("  Tag size: {}mm", args.tag_size);
     println!("  Output: {}", args.output);
 
-    let generator = PdfGenerator::new(paper_size, args.tag_size);
+    let generator = PdfGenerator::new(paper_size, args.tag_size, args.measurement_axes);
     generator.generate(&args.output)?;
 
     println!("✓ PDF generated successfully: {}", args.output);

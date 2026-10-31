@@ -8,16 +8,18 @@ use crate::apriltag_generator::{get_tag_pattern, get_bit_value};
 pub struct PdfGenerator {
     paper_size: PaperSize,
     tag_config: AprilTagConfig,
+    measurement_axes: bool,
 }
 
 impl PdfGenerator {
-    pub fn new(paper_size: PaperSize, tag_size_mm: f64) -> Self {
+    pub fn new(paper_size: PaperSize, tag_size_mm: f64, measurement_axes: bool) -> Self {
         // Get tag configuration specific to this paper size
         let tag_config = AprilTagConfig::for_paper_size(paper_size, tag_size_mm);
 
         Self {
             paper_size,
             tag_config,
+            measurement_axes,
         }
     }
 
@@ -47,10 +49,81 @@ impl PdfGenerator {
         // Add AprilTag images
         self.embed_apriltags(&layer, &doc)?;
 
+        if self.measurement_axes {
+            self.draw_measurement_axes(&layer, &doc)?;
+        }
+
         // Save PDF
         doc.save(&mut std::io::BufWriter::new(
             std::fs::File::create(output_path)?
         ))?;
+
+        Ok(())
+    }
+
+    fn draw_measurement_axes(&self, layer: &PdfLayerReference, doc: &PdfDocumentReference) -> Result<()> {
+        let positions = calculate_marker_positions(self.paper_size, &self.tag_config);
+        let tag_size = self.tag_config.size_mm as f32;
+        let gap = 10.0_f32;
+        let (left, bottom) = (positions[3].0 as f32, positions[3].1 as f32);
+        // Connect the tag centerlines, leaving 10 mm to each adjacent black edge.
+        let x_axis_y = bottom + tag_size / 2.0;
+        let y_axis_x = left + tag_size / 2.0;
+        let x_start = left + tag_size + gap;
+        let x_end = positions[2].0 as f32 - gap;
+        let y_start = bottom + tag_size + gap;
+        let y_end = positions[0].1 as f32 - gap;
+        let x_length = x_end - x_start;
+        let y_length = y_end - y_start;
+        anyhow::ensure!(x_length > 0.0 && y_length > 0.0,
+            "Not enough room for measurement axes with 10 mm clearance; use smaller tags");
+        let font = doc.add_builtin_font(BuiltinFont::Helvetica)?;
+
+        layer.set_outline_color(Color::Greyscale(Greyscale::new(0.0, None)));
+        layer.set_fill_color(Color::Greyscale(Greyscale::new(0.0, None)));
+        layer.set_outline_thickness(0.5);
+        layer.set_line_cap_style(LineCapStyle::Butt);
+
+        let draw_line = |x1, y1, x2, y2| {
+            layer.add_line(Line {
+                points: vec![
+                    (Point::new(Mm(x1), Mm(y1)), false),
+                    (Point::new(Mm(x2), Mm(y2)), false),
+                ],
+                is_closed: false,
+            });
+        };
+        draw_line(x_start, x_axis_y, x_end, x_axis_y);
+        draw_line(y_axis_x, y_start, y_axis_x, y_end);
+
+        // Each axis has its own zero. Keep 10 mm ticks and mark the exact endpoint,
+        // including lengths that are not multiples of 10 mm (e.g. 167 mm on A4).
+        for (horizontal, length) in [(true, x_length), (false, y_length)] {
+            let mut offsets: Vec<f32> = (0..=(length / 10.0).floor() as u32)
+                .map(|i| i as f32 * 10.0).collect();
+            if (offsets.last().unwrap() - length).abs() > 0.001 {
+                offsets.push(length);
+            }
+            for offset in offsets {
+                let endpoint = offset == 0.0 || (offset - length).abs() < 0.001;
+                let major = (offset % 50.0).abs() < 0.001;
+                let tick = if endpoint || major { 2.0 } else { 1.0 };
+                if horizontal {
+                    draw_line(x_start + offset, x_axis_y - tick, x_start + offset, x_axis_y + tick);
+                } else {
+                    draw_line(y_axis_x - tick, y_start + offset, y_axis_x + tick, y_start + offset);
+                }
+                if major || endpoint {
+                    let label = format!("{offset:.1}")
+                        .trim_end_matches('0').trim_end_matches('.').to_owned();
+                    if horizontal {
+                        layer.use_text(label, 9.0, Mm(x_start + offset - 2.0), Mm(x_axis_y - 6.0), &font);
+                    } else {
+                        layer.use_text(label, 9.0, Mm(y_axis_x - 9.0), Mm(y_start + offset - 1.0), &font);
+                    }
+                }
+            }
+        }
 
         Ok(())
     }
@@ -244,10 +317,55 @@ mod tests {
     use printpdf::lopdf::{content::Content, Document};
 
     #[test]
+    fn measurement_axes_align_with_tag_centers_and_leave_10_mm_clearance() {
+        for paper_size in [PaperSize::A4, PaperSize::Letter, PaperSize::A3] {
+          for tag_size in [40.0, 50.0, 60.0] {
+            let generator = PdfGenerator::new(paper_size, tag_size, true);
+            let (width, height) = paper_size.dimensions_mm();
+            let (doc, page, layer) = PdfDocument::new(
+                "Measurement axes", Mm(width as f32), Mm(height as f32), "Axes",
+            );
+            generator.draw_measurement_axes(&doc.get_page(page).get_layer(layer), &doc).unwrap();
+            let pdf = Document::load_mem(&doc.save_to_bytes().unwrap()).unwrap();
+            let page_id = *pdf.get_pages().values().next().unwrap();
+            let content = Content::decode(&pdf.get_page_content(page_id).unwrap()).unwrap();
+            let mut axes = Vec::new();
+            for ops in content.operations.windows(2) {
+                if ops[0].operator == "m" && ops[1].operator == "l" {
+                    let point = |op: &printpdf::lopdf::content::Operation| (
+                        op.operands[0].as_float().unwrap() as f64 * 25.4 / 72.0,
+                        op.operands[1].as_float().unwrap() as f64 * 25.4 / 72.0,
+                    );
+                    let start = point(&ops[0]);
+                    let end = point(&ops[1]);
+                    let delta = (end.0 - start.0, end.1 - start.1);
+                    if delta.0.hypot(delta.1) > 4.001 {
+                        axes.push((start, end));
+                    }
+                }
+            }
+            assert_eq!(axes.len(), 2);
+            let expected = [
+                ((25.0 + tag_size, 15.0 + tag_size / 2.0), (width - 25.0 - tag_size, 15.0 + tag_size / 2.0)),
+                ((15.0 + tag_size / 2.0, 25.0 + tag_size), (15.0 + tag_size / 2.0, height - 25.0 - tag_size)),
+            ];
+            for (axis, expected) in axes.iter().zip(expected) {
+                for (actual, expected) in [
+                    (axis.0.0, expected.0.0), (axis.0.1, expected.0.1),
+                    (axis.1.0, expected.1.0), (axis.1.1, expected.1.1),
+                ] {
+                    assert!((actual - expected).abs() < 0.001);
+                }
+            }
+          }
+        }
+    }
+
+    #[test]
     fn pdf_black_squares_have_requested_size_and_position() {
         for paper_size in [PaperSize::A4, PaperSize::Letter, PaperSize::A3] {
             for tag_size_mm in [40.0, 50.0, 60.0] {
-                let generator = PdfGenerator::new(paper_size, tag_size_mm);
+                let generator = PdfGenerator::new(paper_size, tag_size_mm, false);
                 let (width, height) = paper_size.dimensions_mm();
                 let (doc, page, layer) = PdfDocument::new(
                     "Size regression", Mm(width as f32), Mm(height as f32), "Tags",
